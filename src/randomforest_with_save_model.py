@@ -169,16 +169,6 @@ def load_data_from_db(year: int, sample_frac: float = 1.0) -> pd.DataFrame:
 
 
 def preprocess_data(combined_data: pd.DataFrame, year: int) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Preprocess the data by dropping unnecessary columns and creating feature and target datasets.
-
-    Args:
-        combined_data (pd.DataFrame): The combined data from the database.
-        year (int): The year for which the data is being processed.
-
-    Returns:
-        Tuple[pd.DataFrame, pd.Series]: The feature dataset and target variable.
-    """
     combined_data = combined_data.dropna(subset=[f'demclas'])
     columns_to_drop = [
         'ad8_1', 'ad8_2', 'ad8_3', 'ad8_4', 'ad8_5', 'ad8_6', 'ad8_7', 'ad8_8', 'ad8_score', 'spid', 'opid',
@@ -192,8 +182,13 @@ def preprocess_data(combined_data: pd.DataFrame, year: int) -> Tuple[pd.DataFram
     elif year == 12:
         columns_to_drop.append('hc12dementage')
 
+
+
     X = combined_data.drop(columns_to_drop, axis=1)
     y = combined_data[f'demclas']
+
+    non_numeric_columns = X.select_dtypes(include=['object']).columns
+    X = pd.get_dummies(X, columns=non_numeric_columns)
 
     return X, y
 
@@ -221,38 +216,29 @@ def setup_transformations(X: pd.DataFrame) -> ColumnTransformer:
     return column_transformer
 
 
-def train_and_evaluate_model(X, y, year, target_var):
+def train_and_evaluate_model(X: pd.DataFrame, y: pd.Series, year: int, target_var: str) -> Tuple[RandomForestRegressor, float, ColumnTransformer]:
     datetime_str = pd.to_datetime('today').strftime('%Y-%m-%d-%H-%M-%S')
     file_path = os.path.join(os.path.dirname(__file__),
                              f'models//{target_var}/{datetime_str.split("-")[0]}/{datetime_str.split("-")[1]}/{datetime_str.split("-")[2].split("-")[0]}')
     os.makedirs(file_path, exist_ok=True)
 
-    if len(X) == 1:
-        # If there is only one sample, use the entire dataset for training
-        X_train, X_test, y_train, y_test = X, X, y, y
-    else:
-        # Split the dataset into training and testing sets
-        logging.info(f"Splitting dataset into training and testing sets for year {year}")
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Split the dataset into training and testing sets
+    logging.info(f"Splitting dataset into training and testing sets for year {year}")
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Set up the column transformer
+    column_transformer = setup_transformations(X)
+
+    # Fit the column transformer on the training data
+    X_train_transformed = column_transformer.fit_transform(X_train)
+    X_test_transformed = column_transformer.transform(X_test)
 
     logging.info(f"Training Random Forest Model for year {year}")
     n_estimators = 100
     n_jobs = -1  # Use all available cores
 
-    column_transformer = setup_transformations(X)
-
-    column_transformer.fit(X)  # Fit the ColumnTransformer explicitly
-
-    # Save the fitted ColumnTransformer
-    joblib.dump(column_transformer, os.path.join(file_path, 'column_transformer.joblib'))
-
-    logging.info(f"ColumnTransformer fitted: {hasattr(column_transformer, 'n_features_in_')}")
-
-    X_train_transformed = column_transformer.transform(X_train)  # Transform the training data
-    X_test_transformed = column_transformer.transform(X_test)  # Transform the testing data
-
     rf = RandomForestRegressor(n_estimators=n_estimators, random_state=42, n_jobs=n_jobs)
-    rf.fit(X_train_transformed, y_train)  # Fit the Random Forest model with the transformed training data
+    rf.fit(X_train_transformed, y_train)
 
     logging.info(f"Evaluating Model for year {year}")
     y_pred = rf.predict(X_test_transformed)
@@ -376,7 +362,8 @@ def plot_shap_values(rf: RandomForestRegressor, X_train: np.ndarray, column_tran
     logging.info(f"SHAP waterfall plot saved to {waterfall_filename}")
 
 
-def main(target_var: str, years: int, sample_frac: float = 1.0, shap_enabled: bool = False) -> None:
+def main(target_var: str, years: int, sample_frac: float = 1.0, shap_enabled: bool = False, year_to_predict: int = 1) -> None:
+    # ... (rest of the code remains the same)
     start_time = datetime.datetime.now()
     logging.info(f"Starting script at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -392,12 +379,34 @@ def main(target_var: str, years: int, sample_frac: float = 1.0, shap_enabled: bo
 
         logging.info(f"Finished processing data for year {year}")
 
-        # Make a prediction using the trained model and column transformer
-        year_to_predict = year
-        random_specimen = get_random_specimen(year_to_predict)
-        input_data = random_specimen.drop(columns=[f'demclas'], errors='ignore')
-        prediction = predict(year_to_predict, input_data, column_transformer)  # Pass column_transformer to predict
-        logging.info(f"Prediction for year {year_to_predict}: {prediction}")
+        # Make a prediction for a random person in the specified year
+        if year_to_predict <= years:
+            combined_data = load_data_from_db(year_to_predict, sample_frac)
+            X, y = preprocess_data(combined_data, year_to_predict)
+            column_transformer = setup_transformations(X)
+            X_transformed = column_transformer.fit_transform(X)
+
+            # Select a random person from the dataset
+            random_index = np.random.randint(0, len(X))
+            random_person = X.iloc[random_index]
+
+            # Transform the random person's features using the column transformer
+            random_person_transformed = column_transformer.transform(random_person.to_frame().T)
+
+            # Load the trained model for the specified year
+            model_file = f"models/{target_var}/{year_to_predict}/rf_{target_var}_{year_to_predict}.joblib"
+            rf = joblib.load(model_file)
+
+            # Make a prediction for the random person
+            prediction = rf.predict(random_person_transformed)
+
+            logging.info(f"Prediction for a random person in year {year_to_predict}: {random_person_transformed}")
+            logging.info(f"Prediction: {{prediction[0]}}")
+            logging.info(f"demclas: {{y.iloc[random_index]}}")
+        else:
+            logging.info(f"No model available for year {year_to_predict}. Please train a model for that year first.")
+
+        # logging.info(f"Prediction for year {year_to_predict}: {prediction}")
 
     end_time = datetime.datetime.now()
     logging.info(f"Script completed at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -405,69 +414,7 @@ def main(target_var: str, years: int, sample_frac: float = 1.0, shap_enabled: bo
     logging.info(f"Total time taken: {total_elapsed_time / 60:.2f} minutes")
 
 
-def get_random_specimen(year: int) -> pd.DataFrame:
-    SQLITE_DB_FILE = "nhats.db"
-    conn = sqlite3.connect(SQLITE_DB_FILE)
 
-    table_name = f"NHATS_Round_{year}_SP_File"
-    query = f"SELECT * FROM {table_name} ORDER BY RANDOM() LIMIT 1"
-    random_specimen = pd.read_sql_query(query, conn)
-    conn.close()
-
-    return random_specimen
-
-
-def remove_suffixes(df, suffix='_tracker'):
-    """
-    Removes a specified suffix from the column names of a DataFrame.
-
-    Args:
-        df (pd.DataFrame): The DataFrame whose column names are to be modified.
-        suffix (str): The suffix to be removed from the column names.
-
-    Returns:
-        pd.DataFrame: A DataFrame with updated column names.
-    """
-    df.columns = [col.replace(suffix, '') if col.endswith(suffix) else col for col in df.columns]
-    return df
-
-
-def predict(year: int, input_data: pd.DataFrame, column_transformer: ColumnTransformer) -> int:
-    datetime_str = pd.to_datetime('today').strftime('%Y-%m-%d-%H-%M-%S')
-    file_path = os.path.join(os.path.dirname(__file__),
-                             f'models//{target_var}/{datetime_str.split("-")[0]}/{datetime_str.split("-")[1]}/{datetime_str.split("-")[2].split("-")[0]}')
-
-    model_dir = os.path.join(os.path.dirname(__file__), f'models/demclas')
-    model_files = glob.glob(os.path.join(model_dir, file_path, f'rf_{target_var}_{year}_mse_*.joblib'))
-
-    if not model_files:
-        raise ValueError(f"No model found for year {year}")
-
-    model_file = model_files[0]
-    model = joblib.load(model_file)
-
-    # Get the expected columns from the fitted ColumnTransformer
-    expected_columns = column_transformer.feature_names_in_
-
-    # Create a new DataFrame with the expected columns
-    input_data_aligned = pd.DataFrame(columns=expected_columns)
-
-    # Fill the aligned DataFrame with the input data values
-    for column in input_data.columns:
-        if column in expected_columns:
-            input_data_aligned[column] = input_data[column]
-
-    # Fill missing columns with a default value (e.g., 0)
-    input_data_aligned.fillna(0, inplace=True)
-
-    try:
-        # Transform the input data using the loaded ColumnTransformer
-        transformed_data = column_transformer.transform(input_data_aligned)
-        prediction = model.predict(transformed_data)
-        return int(prediction[0])
-    except ValueError as e:
-        logging.error(f"Error during prediction: {str(e)}")
-        raise
 
 
 if __name__ == "__main__":
@@ -475,20 +422,5 @@ if __name__ == "__main__":
     years = 1
     sample_frac = 0.5
     shap_enabled = False
-    main(target_var, years, sample_frac, shap_enabled)
-
     year_to_predict = 1  # Choose the year for which you want to make a prediction
-    random_specimen = get_random_specimen(year_to_predict)
-    input_data = random_specimen.copy()  # Create a copy of the input data
-
-    if 'demclas' in input_data.columns:
-        y = input_data['demclas']
-        input_data = input_data.drop(columns=['demclas'], errors='ignore')
-    else:
-        y = None
-
-    # Get the trained model and column transformer for the specified year
-    rf, mse, column_transformer = train_and_evaluate_model(input_data, y, year_to_predict, target_var)
-
-    prediction = predict(year_to_predict, input_data, column_transformer)  # Pass column_transformer to predict
-    logging.info(f"Prediction for year {year_to_predict}: {prediction}")
+    main(target_var, years, sample_frac, shap_enabled, year_to_predict)
