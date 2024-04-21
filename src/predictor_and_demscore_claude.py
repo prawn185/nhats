@@ -160,6 +160,7 @@ for year in range(2, 13):
     data = load_data_from_db(year)
 
     data = data[(data['demclas'] != -1) & (data['demclas'] != -9)]
+    # Replace NaN values in the target variable with -3
 
     # Step 2: Prepare the data for training
     # Exclude the target variable and any other unwanted columns
@@ -194,12 +195,7 @@ for year in range(2, 13):
     X = preprocessor.fit_transform(data[features])
 
     # Step 3: Split the data into training and testing sets
-    #ValueError: Input y contains NaN
-    if data[target].isnull().values.any():
-        print("There are NaN values in the target variable. Please handle them before proceeding.")
-        continue
-
-
+    data[target] = data[target].fillna(-3)
     y = data[target]
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
@@ -242,7 +238,7 @@ for year in range(2, 13):
         # Get the predicted class probabilities
         class_probabilities = predicted_proba[0]
         predicted_class_index = np.argmax(class_probabilities)
-        predicted_demclas = predicted_class_index + 1  # Directly use the predicted class index
+        predicted_demclas = predicted_class_index  # Directly use the predicted class index
 
         # Get the actual demclas value for the person from the original data DataFrame
         actual_demclas = y_test.iloc[test_index]
@@ -260,15 +256,7 @@ for year in range(2, 13):
         print(f"Actual demclas: {actual_demclas}")
         print(f"Predicted demclas: {predicted_demclas}")
         print(f"Predicted class probabilities: {class_probabilities}")
-        # dem score starts at 3,
-        # if the predicted class is 3 then the score should be 3
-        # if the predicted class is 2 then the score should be 3 - class_probabilities[2]
-        # if the predicted class is 1 then the score should be 3 - class_probabilities[2] - (class_probabilities[1] * 2)
-        demscore = 0
-        for i in range(len(class_probabilities)):
-            demscore += (3 - i) * class_probabilities[i]
-        print(f"DemScore: {demscore}")
-        data.loc[y_test.index[test_index], 'demscore'] = demscore
+
         # Check if the predicted demclas is different from the actual demclas
         if predicted_demclas != actual_demclas:
             # Plot the predicted probabilities for each class
@@ -283,8 +271,7 @@ for year in range(2, 13):
             plt.tight_layout()
 
             # Save the graph with a meaningful name and a unique identifier
-            #make the spid to no dp
-            plt.savefig(f'prediction_graphs/{data.loc[y_test.index[test_index], "spid"]}_prediction_{demscore}.png')
+            # make the spid to no dp
 
             # Close the plot to avoid memory leaks
             plt.close()
@@ -292,8 +279,6 @@ for year in range(2, 13):
         # save the data to the database
         conn = sqlite3.connect('nhats.db')
         c = conn.cursor()
-        c.execute(
-            f"UPDATE {table_map[year]['sp']} SET demscore = {demscore} WHERE spid = {data.loc[y_test.index[test_index], 'spid']}")
         c.execute(
             f"UPDATE {table_map[year]['sp']} SET predicted_demclas = {predicted_demclas} WHERE spid = {data.loc[y_test.index[test_index], 'spid']}")
         conn.commit()
