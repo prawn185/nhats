@@ -5,8 +5,9 @@ import sqlite3
 
 import numpy as np
 import pandas as pd
+from imblearn.under_sampling import RandomUnderSampler
 from matplotlib import pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
@@ -14,13 +15,14 @@ from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from tqdm import tqdm
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
+from imblearn.over_sampling import SMOTE
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 logging.basicConfig(level=logging.INFO)
 
-NUM_YEARS = 12
-TRAIN_YEARS = [1, 2]
-TEST_YEAR = 12
+NUM_YEARS = 1
+TRAIN_YEARS = [1]
+TEST_YEAR = 2
 
 table_map = {
     1: {
@@ -107,63 +109,100 @@ def load_predicted_demclas_data() -> pd.DataFrame:
     SQLITE_DB_FILE = "nhats.db"
     conn = sqlite3.connect(SQLITE_DB_FILE)
 
-    predicted_demclas_data = pd.DataFrame(columns=['spid', 'year', 'demclas'])
-
+    predicted_demclas_data = pd.DataFrame()
     for year in tqdm(range(1, NUM_YEARS + 1), desc="Loading data"):
         # logging.info(f"Loading predicted_demclas data for year {year}")
         table_name = table_map[year]['sp']
-        query = f"SELECT spid, {year} AS year, predicted_demclas FROM {table_name}"
+
+        # Find the count of each demclas in the current year
+        demclas_count_query = f"""
+            SELECT demclas, COUNT(*) AS count
+            FROM {table_name}
+            WHERE demclas >= 1 AND demclas <= 3
+            GROUP BY demclas
+        """
+        demclas_count_df = pd.read_sql_query(demclas_count_query, conn)
+
+        # Find the minimum count among all demclas in the current year
+        min_count = demclas_count_df['count'].min()
+
+        # Modify the SQL query to use the minimum count for each demclas
+        query = f"""
+            SELECT {year} AS year, *
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY demclas ORDER BY rowid) AS rn
+                FROM {table_name}
+                WHERE demclas >= 1 AND demclas <= 3
+            ) t
+            WHERE rn <= {min_count}
+        """
         year_data = pd.read_sql_query(query, conn)
         predicted_demclas_data = pd.concat([predicted_demclas_data, year_data], ignore_index=True, copy=False)
-    conn.close()
+
+        # Print the demclas distribution for the current year
+        print(f"Demclas distribution for year {year}:")
+        print(year_data['demclas'].value_counts())
+        print()
+
+        # Print the cumulative demclas distribution
+        print("Cumulative demclas distribution:")
+        print(predicted_demclas_data['demclas'].value_counts())
+        print()
+
+    # Print the final demclas distribution
+    print("Final demclas distribution:")
+    print(predicted_demclas_data['demclas'].value_counts())
+
+    # preprocess data
     return predicted_demclas_data
 
 
-def create_trajectory(predicted_demclas_data: pd.DataFrame) -> pd.DataFrame:
-    trajectory_data = predicted_demclas_data.pivot(index='spid', columns='year', values='predicted_demclas')
-    trajectory_data_filtered = trajectory_data.dropna(thresh=NUM_YEARS)  # Keep individuals with data for all years
+def create_trajectory(predicted_demclas_data: pd.DataFrame, min_years: int) -> pd.DataFrame:
+    trajectory_data = predicted_demclas_data.pivot(index='spid', columns='year', values='demclas')
+    trajectory_data_filtered = trajectory_data.dropna(thresh=min_years)  # Keep individuals with data for at least min_years
 
     if trajectory_data_filtered.empty:
-        return pd.DataFrame()  # Return an empty dataframe if no individuals have complete data
+        return pd.DataFrame()  # Return an empty dataframe if no individuals have the minimum required data
 
     return trajectory_data_filtered
 
 
 def predict_test_year(trajectory: pd.Series) -> tuple:
-    train_years_idx = [year - 1 for year in TRAIN_YEARS]  # Convert years to zero-based indices
-    X = trajectory.index.values.reshape(-1, 1)[train_years_idx]  # Use the specified years for training
+    available_years = trajectory.index[trajectory.notna()]
+    train_years_idx = [year - 1 for year in available_years if year != TEST_YEAR]  # Convert years to zero-based indices
+
+    if len(train_years_idx) == 0:
+        logging.warning(f"No available training years for SPID: {trajectory.name}")
+        return None, None  # Return None if there are no available training years
+
+    X = np.array(train_years_idx).reshape(-1, 1)  # Use the available years for training
     y = trajectory.values[train_years_idx]
 
     model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=15)
     model.fit(X, y)
-    logging.info(f"-------------------------------------------")
-    logging.info(f"Model trained on years: {TRAIN_YEARS}")
-    logging.info(f"Model Test Year Prediction: {TEST_YEAR}")
-    actual_test_year = trajectory.values[TEST_YEAR - 1]
-    predicted_test_year = model.predict([[TEST_YEAR]])[0]
 
-    mse = mean_squared_error([actual_test_year], [predicted_test_year])
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error([actual_test_year], [predicted_test_year])
-    r2 = r2_score([actual_test_year], [predicted_test_year])
+    conn = sqlite3.connect("nhats.db")
+    query = f"""
+        SELECT demclas
+        FROM {table_map[TEST_YEAR]['sp']}
+        WHERE demclas >= 1 AND demclas <= 3
+    """
 
-    if actual_test_year == 0:
-        accuracy = 0
-    else:
-        accuracy = round(np.abs(actual_test_year - round(predicted_test_year)))
+    year_data = pd.read_sql_query(query, conn)
+    actual_test_year = year_data['demclas'].values[0] if len(year_data) > 0 else None
 
-    reason = f"The model's performance metrics for the {TEST_YEAR}th year prediction:\n" \
-             f"RMSE = {rmse:.2f}, MAE = {mae:.2f}, R^2 = {r2:.2f}, Error = {accuracy}"
-
-    return predicted_test_year, actual_test_year, accuracy, reason
+    predicted_test_year = model.predict([[TEST_YEAR - 1]])[0] if actual_test_year is not None else None
+    return predicted_test_year, actual_test_year
 
 
 def generate_graph(spid, trajectory, predicted_test_year, actual_test_year):
     plt.figure(figsize=(15, 6))
-    plt.plot(range(1, NUM_YEARS), trajectory.iloc[:-1], marker='o', linestyle='-', color='blue', label='Previous Demclas')
+    plt.plot(range(1, NUM_YEARS), trajectory.iloc[:-1], marker='o', linestyle='-', color='blue',
+             label='Previous Demclas')
     plt.plot(NUM_YEARS, actual_test_year, marker='o', linestyle='-', color='turquoise', label='Actual Demclas')
     plt.plot(NUM_YEARS, predicted_test_year, marker='x', linestyle='-', color='red', label='Predicted Demclas')
-    plt.plot(NUM_YEARS, round(predicted_test_year), marker='x', linestyle='-', color='orange', label='Predicted Demclas (Rounded)')
+    plt.plot(NUM_YEARS, round(predicted_test_year), marker='x', linestyle='-', color='orange',
+             label='Predicted Demclas (Rounded)')
     plt.xlabel('Year')
     plt.ylabel('Demclas')
     plt.title(f'Demclas Trajectory for SPID: {spid}')
@@ -178,7 +217,7 @@ def generate_graph(spid, trajectory, predicted_test_year, actual_test_year):
     y_labels = ['Possible Dementa', 'Probable Dementia', 'No Dementia']
     plt.yticks(y_ticks, y_labels)
     # Set y-axis limits to start from 1
-    plt.ylim( 0.75, 3.2)
+    plt.ylim(0.75, 3.2)
 
     # Create the "prediction_graphs" folder if it doesn't exist
     os.makedirs("prediction_graphs", exist_ok=True)
@@ -187,43 +226,58 @@ def generate_graph(spid, trajectory, predicted_test_year, actual_test_year):
     plt.savefig(f"prediction_graphs/trajectory_{spid}.png")
     plt.close()
 
+
 def main():
     predicted_demclas_data = load_predicted_demclas_data()
-    trajectory_data = create_trajectory(predicted_demclas_data)
 
+    trajectory_data = create_trajectory(predicted_demclas_data, min_years=1)
+    #
     if trajectory_data.empty:
         logging.warning(f"No individuals found with complete data for all {NUM_YEARS} years.")
         return
 
     num_individuals = len(trajectory_data)
-    logging.info(f"Number of individuals with data for all {NUM_YEARS} years: {num_individuals}")
 
     accuracies = []
     truth_accuracy = []
     predicted_values = []
     actual_values = []
+    exact = 0
+    not_exact = 0
+    demclas1 = 0
+    demclas2 = 0
+    demclas3 = 0
 
     for spid, trajectory in tqdm(trajectory_data.iterrows(), total=num_individuals, desc="Processing individuals"):
-        # logging.info(f"SPID: {spid}")
-        # logging.info(f"Trajectory: {trajectory.tolist()}")
+        predicted_test_year, actual_test_year = predict_test_year(trajectory)
+        if actual_test_year is None:
+            continue  # Skip individuals without the actual test year data
 
-        predicted_test_year, actual_test_year, accuracy, reason = predict_test_year(trajectory)
+        if actual_test_year == 1:
+            demclas1 += 1
+        elif actual_test_year == 2:
+            demclas2 += 1
+        elif actual_test_year == 3:
+            demclas3 += 1
 
-        # logging.info(f"Predicted {TEST_YEAR}th year: {predicted_test_year:.6f}")
-        # logging.info(f"Actual {TEST_YEAR}th year: {actual_test_year:.6f}")
-        # logging.info(f"Error Diff: {accuracy}")
-        # logging.info(f"Reason: {reason}")
-        # logging.info("------------------------------------------------------------------------------------------------")
+        if predicted_test_year == actual_test_year:
+            exact += 1
+        else:
+            not_exact += 1
 
+        accuracy = np.abs(predicted_test_year - actual_test_year)
         accuracies.append(accuracy)
         truth_accuracy.append(actual_test_year)
         predicted_values.append(predicted_test_year)
         actual_values.append(actual_test_year)
-        generate_graph(spid, trajectory, predicted_test_year, actual_test_year)
 
-    overall_accuracy = sum(accuracies) / sum(truth_accuracy) * 100
+    overall_accuracy = (1 - (sum(accuracies) / sum(truth_accuracy))) * 100
+
+    logging.info(f"Exact: {exact}")
+    logging.info(f"Not Exact: {not_exact}")
     logging.info(f"Overall Error: {overall_accuracy:.2f}%")
     logging.info(f"Overall Error Diff: {sum(accuracies)}/{sum(truth_accuracy)}")
+
 
 if __name__ == "__main__":
     main()
